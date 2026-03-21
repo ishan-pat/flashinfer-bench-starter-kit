@@ -101,11 +101,10 @@ def routing_kernel(
 
     for _t in tl.static_range(BLOCK_T):
         t = tok_start + _t
-        if t >= seq_len:
-            break
+        mask = t < seq_len
 
         # ---- 1. sigmoid(logits) + bias ----
-        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range)  # [256]
+        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range, mask=mask, other=-1e9)  # [256]
         expert_scores = tl.sigmoid(logits) + bias                          # [256]
 
         # ---- 2. Group scoring: per group, sum top-2 expert scores ----
@@ -114,7 +113,8 @@ def routing_kernel(
         for g in tl.static_range(NUM_GROUPS):
             g_base = g * EPG
             g_scores = tl.load(
-                logits_ptr + t * stride_logits_seq + g_base + epg_range
+                logits_ptr + t * stride_logits_seq + g_base + epg_range,
+                mask=mask, other=-1e9
             )  # [32]
             g_scores = tl.sigmoid(g_scores) + tl.load(bias_ptr + g_base + epg_range)
 
@@ -165,8 +165,8 @@ def routing_kernel(
         norm_scores = selected_s / score_sum
 
         # ---- 7. Write outputs ----
-        tl.store(expert_ids_ptr + t * stride_eid_seq + topk_range, selected_exp)
-        tl.store(scores_ptr + t * stride_score_seq + topk_range, norm_scores)
+        tl.store(expert_ids_ptr + t * stride_eid_seq + topk_range, selected_exp, mask=mask)
+        tl.store(scores_ptr + t * stride_score_seq + topk_range, norm_scores, mask=mask)
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +210,7 @@ def expert_gemm1_kernel(
     tok_ids = tl.load(token_ids_ptr + m_range, mask=m_mask, other=0)
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    n_blk = n_start // BLOCK_K  # N-dimension block index (BLOCK_K == 128 == block size)
+    n_blk = n_range // BLOCK_K  # [BLOCK_N]
 
     for k_start in tl.range(0, K, BLOCK_K):
         k_blk = k_start // BLOCK_K
@@ -233,8 +233,8 @@ def expert_gemm1_kernel(
         w_fp8 = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
         w_f32 = w_fp8.to(tl.float32)
         # Scale: w1scale[n_blk, k_blk]
-        w_scale = tl.load(w1scale_ptr + n_blk * stride_w1s_nb + k_blk)
-        w_f32 = w_f32 * w_scale
+        w_scale = tl.load(w1scale_ptr + n_blk * stride_w1s_nb + k_blk, mask=n_mask, other=1.0) # [BLOCK_N]
+        w_f32 = w_f32 * w_scale[:, None]
 
         acc += tl.dot(h_f32, tl.trans(w_f32))
 
@@ -285,7 +285,7 @@ def expert_gemm2_accumulate_kernel(
     weight = r_scores * routed_scaling_factor  # [BLOCK_M]
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    n_blk = n_start // BLOCK_K  # N-block index for scale lookup
+    n_blk = n_range // BLOCK_K  # [BLOCK_N]
 
     for k_start in tl.range(0, K, BLOCK_K):
         k_blk = k_start // BLOCK_K
@@ -301,8 +301,8 @@ def expert_gemm2_accumulate_kernel(
         w_fp8 = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
         w_f32 = w_fp8.to(tl.float32)
         # Scale: w2scale[n_blk, k_blk]  (shape [56, 16])
-        w_scale = tl.load(w2scale_ptr + n_blk * stride_w2s_nb + k_blk)
-        w_f32 = w_f32 * w_scale
+        w_scale = tl.load(w2scale_ptr + n_blk * stride_w2s_nb + k_blk, mask=n_mask, other=1.0) # [BLOCK_N]
+        w_f32 = w_f32 * w_scale[:, None]
 
         acc += tl.dot(i_mk, tl.trans(w_f32))
 
@@ -325,11 +325,11 @@ def _swiglu(gate_up: torch.Tensor) -> torch.Tensor:
     """
     gate_up: [num_tokens, 4096] float32
     returns: [num_tokens, 2048] float32
-    SwiGLU(x) = silu(gate) * up  where gate=x[:2048], up=x[2048:]
+    SwiGLU(x) = silu(up) * gate  where gate=x[:2048], up=x[2048:]
     """
-    gate = gate_up[:, :INTER_DIM]
-    up = gate_up[:, INTER_DIM:]
-    return torch.nn.functional.silu(gate) * up
+    X1 = gate_up[:, :INTER_DIM]
+    X2 = gate_up[:, INTER_DIM:]
+    return torch.nn.functional.silu(X2) * X1
 
 
 # ---------------------------------------------------------------------------
@@ -344,9 +344,9 @@ def kernel(
     gemm1_weights_scale,    # float32,       [32, 32, 56]
     gemm2_weights,          # float8_e4m3fn, [32, 7168, 2048]
     gemm2_weights_scale,    # float32,       [32, 56, 16]
-    output,                 # bfloat16,      [seq_len, 7168]  (DPS: write here)
     local_expert_offset,    # int32 scalar
     routed_scaling_factor,  # float32 scalar
+    output,                 # bfloat16,      [seq_len, 7168]  (DPS: write here)
 ):
     """
     Fused MoE forward pass.
@@ -355,36 +355,115 @@ def kernel(
     Routing covers all 256 global experts; tokens that route to non-local experts
     are simply skipped (their contribution will be accumulated by other devices).
     """
+    import traceback as _tb
+    import sys as _sys
+    import os as _os
+
+    # === REDIRECT PRINT TO FILE ===
+    def print(*args, **kwargs):
+        with open("/tmp/kernel_debug.txt", "a") as f:
+            f.write(" ".join(str(a) for a in args) + "\n")
+
     seq_len = hidden_states.shape[0]
     device = hidden_states.device
+
+    # =========================================================================
+    # LOG 1: Input validation — verify every argument's type, dtype, shape
+    # WHY: Catches framework-level mismatches before any kernel runs.
+    #      If the framework passes unexpected dtypes or shapes, we see it here.
+    # =========================================================================
+    print(f"[DEBUG-1] === KERNEL ENTRY ===", flush=True)
+    print(f"[DEBUG-1] seq_len={seq_len}, device={device}", flush=True)
+    all_args = {
+        "routing_logits": routing_logits,
+        "routing_bias": routing_bias,
+        "hidden_states": hidden_states,
+        "hidden_states_scale": hidden_states_scale,
+        "gemm1_weights": gemm1_weights,
+        "gemm1_weights_scale": gemm1_weights_scale,
+        "gemm2_weights": gemm2_weights,
+        "gemm2_weights_scale": gemm2_weights_scale,
+        "output": output,
+    }
+    for name, t in all_args.items():
+        print(f"[DEBUG-1]   {name:25s} type={type(t).__name__:12s} dtype={t.dtype}  shape={tuple(t.shape)}  strides={t.stride()}  contiguous={t.is_contiguous()}", flush=True)
+    print(f"[DEBUG-1]   local_expert_offset      = {local_expert_offset} (type={type(local_expert_offset).__name__})", flush=True)
+    print(f"[DEBUG-1]   routed_scaling_factor     = {routed_scaling_factor} (type={type(routed_scaling_factor).__name__})", flush=True)
+
+    # =========================================================================
+    # LOG 2: Shape sanity checks
+    # WHY: Validates dimensions match the expected MoE geometry constants.
+    #      A mismatch here means the workload definition differs from our code.
+    # =========================================================================
+    print(f"[DEBUG-2] === SHAPE CHECKS ===", flush=True)
+    expected = {
+        "routing_logits": (seq_len, NUM_GLOBAL_EXPERTS),
+        "routing_bias": (NUM_GLOBAL_EXPERTS,),
+        "hidden_states": (seq_len, HIDDEN_DIM),
+        "hidden_states_scale": (HIDDEN_DIM // FP8_BLOCK_SIZE, seq_len),
+        "gemm1_weights": (NUM_LOCAL_EXPERTS, GATE_UP_DIM, HIDDEN_DIM),
+        "gemm1_weights_scale": (NUM_LOCAL_EXPERTS, GATE_UP_DIM // FP8_BLOCK_SIZE, HIDDEN_DIM // FP8_BLOCK_SIZE),
+        "gemm2_weights": (NUM_LOCAL_EXPERTS, HIDDEN_DIM, INTER_DIM),
+        "gemm2_weights_scale": (NUM_LOCAL_EXPERTS, HIDDEN_DIM // FP8_BLOCK_SIZE, INTER_DIM // FP8_BLOCK_SIZE),
+        "output": (seq_len, HIDDEN_DIM),
+    }
+    for name, exp_shape in expected.items():
+        actual = tuple(all_args[name].shape)
+        match = "OK" if actual == exp_shape else "MISMATCH!"
+        print(f"[DEBUG-2]   {name:25s} expected={exp_shape}  actual={actual}  {match}", flush=True)
 
     # Step 0: zero output (DPS — tensor is pre-allocated but not zeroed)
     output.zero_()
 
-    # Step 1: Routing — determine expert assignments and scores
+    # =========================================================================
+    # LOG 3: Routing kernel launch
+    # WHY: The routing kernel uses complex logic (top-k, group selection).
+    #      If Triton fails to compile or produces garbage, we catch it here.
+    #      Sync + range check validates output correctness.
+    # =========================================================================
+    print(f"[DEBUG-3] === ROUTING KERNEL ===", flush=True)
     expert_ids = torch.empty((seq_len, TOPK), dtype=torch.int32, device=device)
     routing_scores = torch.empty((seq_len, TOPK), dtype=torch.float32, device=device)
 
     bias_f32 = routing_bias.to(torch.float32)
     BLOCK_T = 16
-    routing_kernel[triton.cdiv(seq_len, BLOCK_T),](
-        routing_logits, bias_f32,
-        expert_ids, routing_scores,
-        seq_len,
-        routing_logits.stride(0),
-        expert_ids.stride(0),
-        routing_scores.stride(0),
-        NUM_EXPERTS=NUM_GLOBAL_EXPERTS,
-        NUM_GROUPS=NUM_GROUPS,
-        EPG=EXPERTS_PER_GROUP,
-        KG=NUM_GROUPS_SELECTED,
-        TOPK=TOPK,
-        BLOCK_T=BLOCK_T,
-    )
+    grid_routing = (triton.cdiv(seq_len, BLOCK_T),)
+    print(f"[DEBUG-3]   grid={grid_routing}, BLOCK_T={BLOCK_T}", flush=True)
 
+    try:
+        routing_kernel[grid_routing](
+            routing_logits, bias_f32,
+            expert_ids, routing_scores,
+            seq_len,
+            routing_logits.stride(0),
+            expert_ids.stride(0),
+            routing_scores.stride(0),
+            NUM_EXPERTS=NUM_GLOBAL_EXPERTS,
+            NUM_GROUPS=NUM_GROUPS,
+            EPG=EXPERTS_PER_GROUP,
+            KG=NUM_GROUPS_SELECTED,
+            TOPK=TOPK,
+            BLOCK_T=BLOCK_T,
+        )
+        torch.cuda.synchronize()
+        eid_min = expert_ids.min().item()
+        eid_max = expert_ids.max().item()
+        score_min = routing_scores.min().item()
+        score_max = routing_scores.max().item()
+        has_nan = torch.isnan(routing_scores).any().item()
+        print(f"[DEBUG-3]   expert_ids range=[{eid_min}, {eid_max}]", flush=True)
+        print(f"[DEBUG-3]   scores range=[{score_min:.6f}, {score_max:.6f}], has_nan={has_nan}", flush=True)
+    except Exception as e:
+        print(f"[DEBUG-3]   ROUTING KERNEL FAILED: {e}", flush=True)
+        _tb.print_exc(file=_sys.stdout)
+        raise
+
+    # =========================================================================
     # Step 2: Per-expert FFN
+    # =========================================================================
     rsf = float(routed_scaling_factor)
     local_offset = int(local_expert_offset)
+    print(f"[DEBUG-4] === EXPERT LOOP === local_offset={local_offset}, rsf={rsf}", flush=True)
 
     for local_idx in range(NUM_LOCAL_EXPERTS):
         global_id = local_offset + local_idx
@@ -394,6 +473,13 @@ def kernel(
         num_tok = pairs.shape[0]
         if num_tok == 0:
             continue
+
+        # =====================================================================
+        # LOG 4: Per-expert dispatch info
+        # WHY: Shows which experts are active and how many tokens they get.
+        #      If num_tok is unexpectedly large, it could cause OOM in buffers.
+        # =====================================================================
+        print(f"[DEBUG-4]   Expert {local_idx} (global={global_id}): {num_tok} tokens", flush=True)
 
         tok_ids = pairs[:, 0].to(torch.int32).contiguous()
         slot_ids = pairs[:, 1].contiguous()
@@ -409,45 +495,101 @@ def kernel(
 
         tb = _token_bucket(num_tok)
 
-        # --- GEMM1: hidden → gate+up ---
+        # =====================================================================
+        # LOG 5: GEMM1 launch details
+        # WHY: Captures exact grid dimensions, strides, and buffer shapes.
+        #      Autotuning may fail if grid dims are 0, or strides are wrong.
+        #      FP8 scale indexing bugs would show as wrong stride values.
+        # =====================================================================
         gate_up_buf = torch.empty((num_tok, GATE_UP_DIM), dtype=torch.float32, device=device)
+        print(f"[DEBUG-5]     GEMM1: num_tok={num_tok}, tb={tb}, K={HIDDEN_DIM}, N={GATE_UP_DIM}", flush=True)
+        print(f"[DEBUG-5]       w1.shape={tuple(w1.shape)}, w1.stride={w1.stride()}, w1s.shape={tuple(w1s.shape)}, w1s.stride={w1s.stride()}", flush=True)
+        print(f"[DEBUG-5]       hscale.stride(0)={hidden_states_scale.stride(0)}, h.stride(0)={hidden_states.stride(0)}", flush=True)
+        print(f"[DEBUG-5]       gate_up_buf.shape={tuple(gate_up_buf.shape)}, stride={gate_up_buf.stride()}", flush=True)
 
-        expert_gemm1_kernel[
-            lambda meta: (
-                triton.cdiv(num_tok, meta["BLOCK_M"]),
-                triton.cdiv(GATE_UP_DIM, meta["BLOCK_N"]),
+        try:
+            expert_gemm1_kernel[
+                lambda meta: (
+                    triton.cdiv(num_tok, meta["BLOCK_M"]),
+                    triton.cdiv(GATE_UP_DIM, meta["BLOCK_N"]),
+                )
+            ](
+                hidden_states, hidden_states_scale,
+                tok_ids,
+                w1, w1s,
+                gate_up_buf,
+                num_tok, tb,
+                K=HIDDEN_DIM, N=GATE_UP_DIM,
+                stride_h_seq=hidden_states.stride(0),
+                stride_w1_n=w1.stride(0),
+                stride_gu_tok=gate_up_buf.stride(0),
+                stride_hscale_blk=hidden_states_scale.stride(0),
+                stride_w1s_nb=w1s.stride(0),
             )
-        ](
-            hidden_states, hidden_states_scale,
-            tok_ids,
-            w1, w1s,
-            gate_up_buf,
-            num_tok, tb,
-            K=HIDDEN_DIM, N=GATE_UP_DIM,
-            stride_h_seq=hidden_states.stride(0),
-            stride_w1_n=w1.stride(0),
-            stride_gu_tok=gate_up_buf.stride(0),
-            stride_hscale_blk=hidden_states_scale.stride(0),
-            stride_w1s_nb=w1s.stride(0),
-        )
+            torch.cuda.synchronize()
+            g1_has_nan = torch.isnan(gate_up_buf).any().item()
+            g1_has_inf = torch.isinf(gate_up_buf).any().item()
+            print(f"[DEBUG-5]     GEMM1 OK. has_nan={g1_has_nan}, has_inf={g1_has_inf}, range=[{gate_up_buf.min().item():.4f}, {gate_up_buf.max().item():.4f}]", flush=True)
+        except Exception as e:
+            print(f"[DEBUG-5]     GEMM1 FAILED at expert {local_idx}: {e}", flush=True)
+            _tb.print_exc(file=_sys.stdout)
+            raise
 
-        # --- SwiGLU: [num_tok, 4096] → [num_tok, 2048] ---
-        intermediate = _swiglu(gate_up_buf)
+        # =====================================================================
+        # LOG 6: SwiGLU
+        # WHY: Shape mismatch between gate and up projections would crash here.
+        #      NaN/Inf from GEMM1 propagates and could cause silent corruption.
+        # =====================================================================
+        try:
+            intermediate = _swiglu(gate_up_buf)
+            torch.cuda.synchronize()
+            sw_has_nan = torch.isnan(intermediate).any().item()
+            print(f"[DEBUG-6]     SwiGLU OK. shape={tuple(intermediate.shape)}, has_nan={sw_has_nan}", flush=True)
+        except Exception as e:
+            print(f"[DEBUG-6]     SwiGLU FAILED at expert {local_idx}: {e}", flush=True)
+            _tb.print_exc(file=_sys.stdout)
+            raise
 
-        # --- GEMM2: intermediate → output (atomic accumulate) ---
-        expert_gemm2_accumulate_kernel[
-            lambda meta: (
-                triton.cdiv(num_tok, meta["BLOCK_M"]),
-                triton.cdiv(HIDDEN_DIM, meta["BLOCK_N"]),
+        # =====================================================================
+        # LOG 7: GEMM2 + atomic accumulate
+        # WHY: atomic_add on bfloat16 requires SM >= 90 (Hopper/Blackwell).
+        #      Wrong w2 strides or scale indexing would corrupt output.
+        #      This is the most likely failure point for hardware compat issues.
+        # =====================================================================
+        print(f"[DEBUG-7]     GEMM2: K={INTER_DIM}, N={HIDDEN_DIM}", flush=True)
+        print(f"[DEBUG-7]       w2.shape={tuple(w2.shape)}, w2.stride={w2.stride()}, w2s.shape={tuple(w2s.shape)}, w2s.stride={w2s.stride()}", flush=True)
+        print(f"[DEBUG-7]       inter.stride(0)={intermediate.stride(0)}, out.stride(0)={output.stride(0)}", flush=True)
+
+        try:
+            expert_gemm2_accumulate_kernel[
+                lambda meta: (
+                    triton.cdiv(num_tok, meta["BLOCK_M"]),
+                    triton.cdiv(HIDDEN_DIM, meta["BLOCK_N"]),
+                )
+            ](
+                intermediate, w2, w2s,
+                tok_ids, r_scores, rsf,
+                output,
+                num_tok, tb,
+                K=INTER_DIM, N=HIDDEN_DIM,
+                stride_inter_tok=intermediate.stride(0),
+                stride_w2_n=w2.stride(0),
+                stride_out_seq=output.stride(0),
+                stride_w2s_nb=w2s.stride(0),
             )
-        ](
-            intermediate, w2, w2s,
-            tok_ids, r_scores, rsf,
-            output,
-            num_tok, tb,
-            K=INTER_DIM, N=HIDDEN_DIM,
-            stride_inter_tok=intermediate.stride(0),
-            stride_w2_n=w2.stride(0),
-            stride_out_seq=output.stride(0),
-            stride_w2s_nb=w2s.stride(1),
-        )
+            torch.cuda.synchronize()
+            print(f"[DEBUG-7]     GEMM2 OK.", flush=True)
+        except Exception as e:
+            print(f"[DEBUG-7]     GEMM2 FAILED at expert {local_idx}: {e}", flush=True)
+            _tb.print_exc(file=_sys.stdout)
+            raise
+
+    # =========================================================================
+    # LOG 8: Final check
+    # WHY: Confirms the kernel completed without silent CUDA async errors.
+    # =========================================================================
+    torch.cuda.synchronize()
+    out_has_nan = torch.isnan(output.float()).any().item()
+    out_nonzero = (output != 0).any().item()
+    print(f"[DEBUG-8] === KERNEL COMPLETE === has_nan={out_has_nan}, has_nonzero={out_nonzero}", flush=True)
+
