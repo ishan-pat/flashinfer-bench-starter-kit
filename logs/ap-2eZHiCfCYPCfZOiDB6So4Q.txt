@@ -1,0 +1,149 @@
+
+Mar 24  12:48:28.523
+Packing solution from source files remotely...
+Mar 24  12:48:28.524
+Solution packed: /project/solution.json
+Mar 24  12:48:28.524
+  Name: my-team-solution-v1
+  Definition: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
+Mar 24  12:48:28.524
+  Author: team-name
+  Language: triton
+Mar 24  12:48:28.524
+
+Loading solution...
+Mar 24  12:48:28.525
+Loaded: my-team-solution-v1 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+Mar 24  12:48:28.526
+Contents of trace dir: ['.git', '.gitattributes', 'README.md', 'blob', 'definitions', 'workloads']
+Mar 24  12:50:42.271
+Solution 'my-team-solution-v1' for workload b8f4f012-a32e-4356-b4e1-7665b3d598af: INCORRECT_NUMERICAL
+Mar 24  12:50:42.271
+
+=== KERNEL DEBUG LOGS ===
+Mar 24  12:50:42.272
+[DEBUG-1] === KERNEL ENTRY ===
+[DEBUG-1] seq_len=7, device=cuda:0
+[DEBUG-1]   routing_logits            type=Tensor       dtype=torch.float32  shape=(7, 256)  strides=(256, 1)  contiguous=True
+[DEBUG-1]   routing_bias              type=Tensor       dtype=torch.bfloat16  shape=(256,)  strides=(1,)  contiguous=True
+[DEBUG-1]   hidden_states             type=Tensor       dtype=torch.float8_e4m3fn  shape=(7, 7168)  strides=(7168, 1)  contiguous=True
+[DEBUG-1]   hidden_states_scale       type=Tensor       dtype=torch.float32  shape=(56, 7)  strides=(7, 1)  contiguous=True
+[DEBUG-1]   gemm1_weights             type=Tensor       dtype=torch.float8_e4m3fn  shape=(32, 4096, 7168)  strides=(29360128, 7168, 1)  contiguous=True
+[DEBUG-1]   gemm1_weights_scale       type=Tensor       dtype=torch.float32  shape=(32, 32, 56)  strides=(1792, 56, 1)  contiguous=True
+[DEBUG-1]   gemm2_weights             type=Tensor       dtype=torch.float8_e4m3fn  shape=(32, 7168, 2048)  strides=(14680064, 2048, 1)  contiguous=True
+[DEBUG-1]   gemm2_weights_scale       type=Tensor       dtype=torch.float32  shape=(32, 56, 16)  strides=(896, 16, 1)  contiguous=True
+[DEBUG-1]   output                    type=Tensor       dtype=torch.bfloat16  shape=(7, 7168)  strides=(7168, 1)  contiguous=True
+[DEBUG-1]   local_expert_offset      = 192 (type=int)
+[DEBUG-1]   routed_scaling_factor     = 2.5 (type=float)
+[DEBUG-2] === SHAPE CHECKS ===
+[DEBUG-2]   routing_logits            expected=(7, 256)  actual=(7, 256)  OK
+[DEBUG-2]   routing_bias              expected=(256,)  actual=(256,)  OK
+[DEBUG-2]   hidden_states             expected=(7, 7168)  actual=(7, 7168)  OK
+[DEBUG-2]   hidden_states_scale       expected=(56, 7)  actual=(56, 7)  OK
+[DEBUG-2]   gemm1_weights             expected=(32, 4096, 7168)  actual=(32, 4096, 7168)  OK
+[DEBUG-2]   gemm1_weights_scale       expected=(32, 32, 56)  actual=(32, 32, 56)  OK
+[DEBUG-2]   gemm2_weights             expected=(32, 7168, 2048)  actual=(32, 7168, 2048)  OK
+[DEBUG-2]   gemm2_weights_scale       expected=(32, 56, 16)  actual=(32, 56, 16)  OK
+[DEBUG-2]   output                    expected=(7, 7168)  actual=(7, 7168)  OK
+[DEBUG-3] === ROUTING KERNEL ===
+[DEBUG-3]   grid=(1,), BLOCK_T=16
+[DEBUG-3]   expert_ids range=[11, 255]
+[DEBUG-3]   scores range=[0.121990, 0.129271], has_nan=False
+[DEBUG-4] === EXPERT LOOP === local_offset=192, rsf=2.5
+[DEBUG-4]   Expert 0 (global=192): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-284.8108, 247.0365]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 5 (global=197): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-297.2533, 265.1303]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 7 (global=199): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-296.6723, 327.2873]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 12 (global=204): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-275.1996, 262.5429]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 21 (global=213): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-292.6443, 243.3538]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 23 (global=215): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-273.5498, 258.5215]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-4]   Expert 27 (global=219): 1 tokens
+[DEBUG-5]     GEMM1: num_tok=1, tb=1, K=7168, N=4096
+[DEBUG-5]       w1.shape=(4096, 7168), w1.stride=(7168, 1), w1s.shape=(32, 56), w1s.stride=(56, 1)
+[DEBUG-5]       hscale.stride(0)=7, h.stride(0)=7168
+[DEBUG-5]       gate_up_buf.shape=(1, 4096), stride=(4096, 1)
+[DEBUG-5]     GEMM1 OK. has_nan=False, has_inf=False, range=[-295.3379, 270.7300]
+[DEBUG-6]     SwiGLU OK. shape=(1, 2048), has_nan=False
+[DEBUG-7]     GEMM2: K=2048, N=7168
+[DEBUG-7]       w2.shape=(7168, 2048), w2.stride=(2048, 1), w2s.shape=(56, 16), w2s.stride=(16, 1)
+[DEBUG-7]       inter.stride(0)=2048, out.stride(0)=7168
+[DEBUG-7]     GEMM2 OK.
+[DEBUG-8] === KERNEL COMPLETE === has_nan=False, has_nonzero=True
+Mar 24  12:50:42.272
+
+=========================
+
+Mar 24  12:50:42.272
+
+=== BENCHMARK RESULTS ===
+Mar 24  12:50:42.272
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+Mar 24  12:50:42.272
+  Workload b8f4f012...: INCORRECT_NUMERICAL | abs_err=6.73e+07 | RAW: {"status":"INCORRECT_NUMERICAL","environment":{"hardware":"NVIDIA B200","libs":{"torch":"2.10.0+cu128","triton":"3.6.0","cuda":"12.8"}},"timestamp":"2026-03-24T16:50:42.270101","log":"","correctness":{"max_relative_error":407446624.0,"max_absolute_error":67313664.0,"extra":{"matched_ratio":0.7148238201530612}},"performance":null}
+=========================
+Mar 24  12:50:42.272
+
+Mar 24  12:50:42.381
+Stopping app - local entrypoint completed.
+Mar 24  12:50:43.132
+[W324 16:50:43.359625026 CudaIPCTypes.cpp:16] Producer process has been terminated before all shared CUDA tensors released. See Note [Sharing CUDA tensors]

@@ -118,14 +118,15 @@ def routing_kernel(
             )  # [32]
             g_scores = tl.sigmoid(g_scores) + tl.load(bias_ptr + g_base + epg_range)
 
-            # top-2 sum: two argmax passes
-            max1 = tl.max(g_scores, axis=0)
-            g_scores_tmp = tl.where(g_scores == max1, -1e9, g_scores)
+            # top-2 sum: single-pass max and argmax to handle ties
+            max1, best_idx1 = tl.max(g_scores, axis=0, return_indices=True)
+            g_scores_tmp = tl.where(epg_range == best_idx1, -1e9, g_scores)
             max2 = tl.max(g_scores_tmp, axis=0)
-            gs_val = max1 + tl.maximum(max2, 0.0)
+            gs_val = max1 + max2
             group_scores = tl.where(grp_range == g, gs_val, group_scores)
 
         # ---- 3. Top-KG group selection ----
+        group_scores = group_scores + grp_range * 1e-6  # Deterministic tie-breaker
         running_gs = group_scores
         selected_groups = tl.zeros([NUM_GROUPS], dtype=tl.int32)
         for _k in tl.static_range(KG):
@@ -147,14 +148,14 @@ def routing_kernel(
 
         # Mask non-candidates
         masked_scores = tl.where(candidate_mask > 0, expert_scores, -1e9)
+        masked_scores = masked_scores + exp_range * 1e-6  # Deterministic tie-breaker
 
         # ---- 5. Top-TOPK from 128 candidates ----
         selected_exp = tl.zeros([TOPK], dtype=tl.int32)
         selected_s = tl.zeros([TOPK], dtype=tl.float32)
         running_ms = masked_scores
         for k in tl.static_range(TOPK):
-            best_e = tl.argmax(running_ms, axis=0)
-            best_s = tl.max(running_ms, axis=0)
+            best_s, best_e = tl.max(running_ms, axis=0, return_indices=True)
             selected_exp = tl.where(topk_range == k, best_e, selected_exp)
             selected_s = tl.where(topk_range == k, best_s, selected_s)
             running_ms = tl.where(exp_range == best_e, -1e9, running_ms)
@@ -236,7 +237,7 @@ def expert_gemm1_kernel(
         w_scale = tl.load(w1scale_ptr + n_blk * stride_w1s_nb + k_blk, mask=n_mask, other=1.0) # [BLOCK_N]
         w_f32 = w_f32 * w_scale[:, None]
 
-        acc += tl.dot(h_f32, tl.trans(w_f32))
+        acc += tl.dot(h_f32, tl.trans(w_f32), allow_tf32=False)
 
     # Write gate+up buffer
     out_ptrs = gate_up_ptr + m_range[:, None] * stride_gu_tok + n_range[None, :]
@@ -304,7 +305,7 @@ def expert_gemm2_accumulate_kernel(
         w_scale = tl.load(w2scale_ptr + n_blk * stride_w2s_nb + k_blk, mask=n_mask, other=1.0) # [BLOCK_N]
         w_f32 = w_f32 * w_scale[:, None]
 
-        acc += tl.dot(i_mk, tl.trans(w_f32))
+        acc += tl.dot(i_mk, tl.trans(w_f32), allow_tf32=False)
 
     # Apply routing weight
     acc = acc * weight[:, None]  # [BLOCK_M, BLOCK_N]
