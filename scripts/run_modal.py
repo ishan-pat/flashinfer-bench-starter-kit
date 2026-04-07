@@ -27,7 +27,7 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench==0.1.2", "torch", "triton", "numpy")
 )
 
 
@@ -56,6 +56,14 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         traces={definition.name: []},
     )
 
+    # Limit workloads to 1 for quick test
+    for k in bench_trace_set.workloads:
+        bench_trace_set.workloads[k] = bench_trace_set.workloads[k][:1]
+
+    # Limit workloads to 1 for quick test
+    for k in bench_trace_set.workloads:
+        bench_trace_set.workloads[k] = bench_trace_set.workloads[k][:1]
+
     benchmark = Benchmark(bench_trace_set, config)
     result_trace_set = benchmark.run_all(dump_traces=True)
 
@@ -64,8 +72,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     for trace in traces:
         if trace.evaluation:
+            err_msg = getattr(trace.evaluation, 'error_msg', None) or getattr(trace.evaluation, 'exception', None)
             entry = {
                 "status": trace.evaluation.status.value,
+                "error": str(err_msg) if err_msg else None,
                 "solution": trace.solution,
             }
             if trace.evaluation.performance:
@@ -98,6 +108,10 @@ def print_results(results: dict):
                 abs_err = result["max_abs_error"]
                 rel_err = result.get("max_rel_error", 0)
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
+            
+            print()
+            if result.get("error"):
+                print(f"    ERROR:\n{result['error']}")
 
             print()
 

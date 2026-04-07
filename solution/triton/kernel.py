@@ -101,11 +101,10 @@ def routing_kernel(
 
     for _t in tl.static_range(BLOCK_T):
         t = tok_start + _t
-        if t >= seq_len:
-            break
+        t_mask = t < seq_len
 
         # ---- 1. sigmoid(logits) + bias ----
-        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range)  # [256]
+        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range, mask=t_mask, other=-1e9)  # [256]
         expert_scores = tl.sigmoid(logits) + bias                          # [256]
 
         # ---- 2. Group scoring: per group, sum top-2 expert scores ----
@@ -114,7 +113,8 @@ def routing_kernel(
         for g in tl.static_range(NUM_GROUPS):
             g_base = g * EPG
             g_scores = tl.load(
-                logits_ptr + t * stride_logits_seq + g_base + epg_range
+                logits_ptr + t * stride_logits_seq + g_base + epg_range,
+                mask=t_mask, other=-1e9
             )  # [32]
             g_scores = tl.sigmoid(g_scores) + tl.load(bias_ptr + g_base + epg_range)
 
@@ -138,10 +138,11 @@ def routing_kernel(
         group_of_exp = exp_range // EPG  # [256]  group index for each expert
         candidate_mask = tl.zeros([NUM_EXPERTS], dtype=tl.int32)
         for g in tl.static_range(NUM_GROUPS):
+            # Extract whether group g is selected without using illegal tl.load on a local tensor
             g_sel = tl.sum(tl.where(grp_range == g, selected_groups, 0)) > 0
             candidate_mask = tl.where(
-                group_of_exp == g,
-                tl.where(g_sel, 1, candidate_mask),
+                (group_of_exp == g) & g_sel,
+                1,
                 candidate_mask,
             )
 
@@ -165,8 +166,8 @@ def routing_kernel(
         norm_scores = selected_s / score_sum
 
         # ---- 7. Write outputs ----
-        tl.store(expert_ids_ptr + t * stride_eid_seq + topk_range, selected_exp)
-        tl.store(scores_ptr + t * stride_score_seq + topk_range, norm_scores)
+        tl.store(expert_ids_ptr + t * stride_eid_seq + topk_range, selected_exp, mask=t_mask)
+        tl.store(scores_ptr + t * stride_score_seq + topk_range, norm_scores, mask=t_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +382,7 @@ def kernel(
         TOPK=TOPK,
         BLOCK_T=BLOCK_T,
     )
+    torch.cuda.synchronize()
 
     # Step 2: Per-expert FFN
     rsf = float(routed_scaling_factor)
@@ -430,9 +432,11 @@ def kernel(
             stride_hscale_blk=hidden_states_scale.stride(0),
             stride_w1s_nb=w1s.stride(0),
         )
+        torch.cuda.synchronize()
 
         # --- SwiGLU: [num_tok, 4096] → [num_tok, 2048] ---
         intermediate = _swiglu(gate_up_buf)
+        torch.cuda.synchronize()
 
         # --- GEMM2: intermediate → output (atomic accumulate) ---
         expert_gemm2_accumulate_kernel[
@@ -451,3 +455,4 @@ def kernel(
             stride_out_seq=output.stride(0),
             stride_w2s_nb=w2s.stride(1),
         )
+        torch.cuda.synchronize()
