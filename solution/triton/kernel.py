@@ -272,7 +272,7 @@ def expert_gemm2_kernel(
     routed_scaling_factor,
     w2_ptr,                # [7168, 2048] float8_e4m3fn
     w2scale_ptr,           # [56, 16] float32
-    output_ptr,            # [seq_len, 7168] bfloat16  (atomic add target)
+    output_ptr,            # [seq_len, 7168] float32  (atomic add target)
     num_tokens,
     tok_bucket,
     K: tl.constexpr,       # 2048
@@ -334,7 +334,7 @@ def expert_gemm2_kernel(
     out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
     tl.atomic_add(
         out_ptrs,
-        acc.to(tl.bfloat16),
+        acc,
         mask=m_mask[:, None] & n_mask[None, :],
     )
 
@@ -381,33 +381,43 @@ def kernel(
     seq_len = hidden_states.shape[0]
     device  = hidden_states.device
 
-    # Step 0: zero output
-    output.zero_()
-
-    # Step 1: Routing
-    expert_ids     = torch.empty((seq_len, TOPK.value), dtype=torch.int32,   device=device)
-    routing_scores = torch.empty((seq_len, TOPK.value), dtype=torch.float32, device=device)
-
+    # Step 1: Routing (PyTorch — verified correct against reference)
     bias_f32 = routing_bias.to(torch.float32)
-    BLOCK_T  = 16
-    routing_kernel[triton.cdiv(seq_len, BLOCK_T),](
-        routing_logits, bias_f32,
-        expert_ids, routing_scores,
-        seq_len,
-        routing_logits.stride(0),
-        expert_ids.stride(0),
-        routing_scores.stride(0),
-        NUM_EXPERTS=NUM_GLOBAL_EXPERTS.value,
-        NUM_GROUPS=NUM_GROUPS.value,
-        EPG=EXPERTS_PER_GROUP.value,
-        KG=NUM_GROUPS_SELECTED.value,
-        TOPK=TOPK.value,
-        BLOCK_T=BLOCK_T,
-    )
+    s = torch.sigmoid(routing_logits.float())        # [seq, 256] — used for weights
+    s_with_bias = s + bias_f32                       # [seq, 256] — used for selection
+
+    # Group scoring: top-2 sum per group using s_with_bias
+    group_scores_mat = s_with_bias.view(seq_len, NUM_GROUPS.value, EXPERTS_PER_GROUP.value)
+    top2_vals, _ = group_scores_mat.topk(2, dim=-1)
+    group_scores = top2_vals.sum(-1)                 # [seq, 8]
+
+    # Select top-KG groups
+    _, top_groups = group_scores.topk(NUM_GROUPS_SELECTED.value, dim=-1)  # [seq, 4]
+
+    # Build group mask and select top-TOPK experts using s_with_bias
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, top_groups, 1.0)
+    score_mask = group_mask.unsqueeze(2).expand(
+        seq_len, NUM_GROUPS.value, EXPERTS_PER_GROUP.value
+    ).reshape(seq_len, NUM_GLOBAL_EXPERTS.value)
+    neg_inf = torch.finfo(torch.float32).min
+    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
+    _, top8_ids = scores_pruned.topk(TOPK.value, dim=-1)  # [seq, 8]
+
+    # Routing WEIGHTS: use s (WITHOUT bias), normalize
+    weight_mask = torch.zeros_like(s)
+    weight_mask.scatter_(1, top8_ids, 1.0)
+    weights_full = s * weight_mask                   # [seq, 256]
+    weights_sum = weights_full.sum(-1, keepdim=True).clamp(min=1e-20)
+    weights_full = weights_full / weights_sum        # normalized, rsf applied per-expert below
+
+    expert_ids = top8_ids.to(torch.int32)            # [seq, 8]
 
     # Step 2: Per-expert FFN loop
     rsf = float(routed_scaling_factor)
     local_offset = int(local_expert_offset)
+
+    output_f32 = torch.zeros(seq_len, HIDDEN_DIM.value, dtype=torch.float32, device=device)
 
     for local_idx in range(NUM_LOCAL_EXPERTS.value):
         global_id = local_offset + local_idx
@@ -419,8 +429,8 @@ def kernel(
             continue
 
         tok_ids = pairs[:, 0].to(torch.int32).contiguous()
-        slot_ids = pairs[:, 1].contiguous()
-        r_scores = routing_scores[tok_ids, slot_ids].contiguous()
+        # Per-token routing weight (normalized, without rsf — applied in kernel)
+        r_scores = weights_full[tok_ids, global_id].contiguous()
 
         # Extract weights/scales for this expert
         w1 = gemm1_weights[local_idx]
@@ -464,11 +474,13 @@ def kernel(
         ](
             intermediate, tok_ids, r_scores, rsf,
             w2, w2s,
-            output,
+            output_f32,
             num_tok, tb,
             K=INTER_DIM.value, N=HIDDEN_DIM.value,
             stride_inter_tok=intermediate.stride(0),
             stride_w2_n=w2.stride(0),
             stride_w2s_nb=w2s.stride(0),
-            stride_out_seq=output.stride(0),
+            stride_out_seq=output_f32.stride(0),
         )
+
+    output.copy_(output_f32.to(torch.bfloat16))
