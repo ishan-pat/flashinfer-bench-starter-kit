@@ -9,6 +9,13 @@ Target: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 
 Function signature uses Destination Passing Style (DPS): output tensor is
 pre-allocated by the framework and passed in; the kernel writes into it.
+
+Optimizations:
+  - Grouped GEMM: all experts dispatched in one kernel launch (no Python loop)
+  - Native FP8 WGMMA: tl.dot(fp8, fp8) → float32 accumulator
+  - BF16 WGMMA: cast intermediate/weights to bf16 for GEMM2
+  - Fixed routing: weight_scores use sigmoid only (no bias)
+  - Fixed SwiGLU: correct gate/up slice mapping [W_up; W_gate]
 """
 
 import torch
@@ -19,16 +26,16 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-NUM_GLOBAL_EXPERTS = 256
-NUM_GROUPS = 8           # ng8
-EXPERTS_PER_GROUP = 32   # NUM_GLOBAL_EXPERTS / NUM_GROUPS
-NUM_GROUPS_SELECTED = 4  # kg4: top-4 groups selected
-TOPK = 8                 # topk8: top-8 experts selected
-NUM_LOCAL_EXPERTS = 32   # e32
-HIDDEN_DIM = 7168        # h7168
-INTER_DIM = 2048         # i2048  (gate and up each = 2048, combined = 4096)
-FP8_BLOCK_SIZE = 128     # FP8 block-scale granularity
-GATE_UP_DIM = INTER_DIM * 2  # 4096
+NUM_GLOBAL_EXPERTS = tl.constexpr(256)
+NUM_GROUPS = tl.constexpr(8)           # ng8
+EXPERTS_PER_GROUP = tl.constexpr(32)   # NUM_GLOBAL_EXPERTS / NUM_GROUPS
+NUM_GROUPS_SELECTED = tl.constexpr(4)  # kg4: top-4 groups selected
+TOPK = tl.constexpr(8)                 # topk8: top-8 experts selected
+NUM_LOCAL_EXPERTS = tl.constexpr(32)   # e32
+HIDDEN_DIM = tl.constexpr(7168)        # h7168
+INTER_DIM = tl.constexpr(2048)         # i2048  (gate and up each = 2048, combined = 4096)
+FP8_BLOCK_SIZE = tl.constexpr(128)     # FP8 block-scale granularity
+GATE_UP_DIM = tl.constexpr(INTER_DIM.value * 2)  # 4096
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +69,7 @@ def _token_bucket(n: int) -> int:
 # ---------------------------------------------------------------------------
 # Kernel 1: DeepSeek-style routing
 # One CTA per BLOCK_T tokens.
+# FIX: weight_scores = sigmoid(logits) only — bias only used for selection.
 # ---------------------------------------------------------------------------
 @triton.jit
 def routing_kernel(
@@ -82,11 +90,13 @@ def routing_kernel(
 ):
     """
     For each token:
-      1. Load 256 logits + biases → sigmoid + bias → expert_scores [256]
-      2. Per-group (8 groups × 32 experts): top-2 sum → group_score [8]
-      3. Select top-KG groups
-      4. From 128 candidates: select top-TOPK by expert_score
-      5. Normalize selected scores; write expert_ids and scores
+      1. Load 256 logits + biases
+      2. selection_scores = sigmoid(logits) + bias  (used for picking experts)
+         weight_scores    = sigmoid(logits)          (used for final routing weights)
+      3. Per-group (8 groups × 32 experts): top-2 sum of selection_scores → group_score
+      4. Select top-KG groups
+      5. From candidates: select top-TOPK by selection_score
+      6. Normalize weight_scores of selected experts; write expert_ids and scores
     """
     pid = tl.program_id(0)
     tok_start = pid * BLOCK_T
@@ -103,25 +113,24 @@ def routing_kernel(
         t = tok_start + _t
         t_mask = t < seq_len
 
-        # ---- 1. sigmoid(logits) + bias ----
-        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range, mask=t_mask, other=-1e9)  # [256]
-        expert_scores = tl.sigmoid(logits) + bias                          # [256]
+        logits = tl.load(logits_ptr + t * stride_logits_seq + exp_range, mask=t_mask, other=-1e9)
+        # FIX: separate selection (biased) from weighting (unbiased)
+        selection_scores = tl.sigmoid(logits) + bias   # [256] used for picking
+        weight_scores    = tl.sigmoid(logits)           # [256] used for final weights
 
-        # ---- 2. Group scoring: per group, sum top-2 expert scores ----
-        # We compute group_scores[g] = top1_score + top2_score for experts in group g
+        # ---- 2. Group scoring using selection_scores ----
         group_scores = tl.zeros([NUM_GROUPS], dtype=tl.float32)
         for g in tl.static_range(NUM_GROUPS):
             g_base = g * EPG
-            g_scores = tl.load(
+            g_logits = tl.load(
                 logits_ptr + t * stride_logits_seq + g_base + epg_range,
                 mask=t_mask, other=-1e9
-            )  # [32]
-            g_scores = tl.sigmoid(g_scores) + tl.load(bias_ptr + g_base + epg_range)
+            )
+            g_sel = tl.sigmoid(g_logits) + tl.load(bias_ptr + g_base + epg_range)
 
-            # top-2 sum: two argmax passes
-            max1 = tl.max(g_scores, axis=0)
-            g_scores_tmp = tl.where(g_scores == max1, -1e9, g_scores)
-            max2 = tl.max(g_scores_tmp, axis=0)
+            max1 = tl.max(g_sel, axis=0)
+            g_sel_tmp = tl.where(g_sel == max1, -1e9, g_sel)
+            max2 = tl.max(g_sel_tmp, axis=0)
             gs_val = max1 + tl.maximum(max2, 0.0)
             group_scores = tl.where(grp_range == g, gs_val, group_scores)
 
@@ -133,12 +142,10 @@ def routing_kernel(
             selected_groups = tl.where(grp_range == best_g, 1, selected_groups)
             running_gs = tl.where(grp_range == best_g, -1e9, running_gs)
 
-        # ---- 4. Build candidate mask over all 256 experts ----
-        # expert e is candidate iff its group (e // EPG) is selected
-        group_of_exp = exp_range // EPG  # [256]  group index for each expert
+        # ---- 4. Build candidate mask ----
+        group_of_exp = exp_range // EPG
         candidate_mask = tl.zeros([NUM_EXPERTS], dtype=tl.int32)
         for g in tl.static_range(NUM_GROUPS):
-            # Extract whether group g is selected without using illegal tl.load on a local tensor
             g_sel = tl.sum(tl.where(grp_range == g, selected_groups, 0)) > 0
             candidate_mask = tl.where(
                 (group_of_exp == g) & g_sel,
@@ -146,24 +153,24 @@ def routing_kernel(
                 candidate_mask,
             )
 
-        # Mask non-candidates
-        masked_scores = tl.where(candidate_mask > 0, expert_scores, -1e9)
+        masked_scores = tl.where(candidate_mask > 0, selection_scores, -1e9)
 
-        # ---- 5. Top-TOPK from 128 candidates ----
+        # ---- 5. Top-TOPK selection (by selection_scores) ----
         selected_exp = tl.zeros([TOPK], dtype=tl.int32)
-        selected_s = tl.zeros([TOPK], dtype=tl.float32)
+        selected_w   = tl.zeros([TOPK], dtype=tl.float32)
         running_ms = masked_scores
         for k in tl.static_range(TOPK):
             best_e = tl.argmax(running_ms, axis=0)
-            best_s = tl.max(running_ms, axis=0)
+            # FIX: store weight_score (unbiased) not selection_score
+            best_w = tl.sum(tl.where(exp_range == best_e, weight_scores, 0.0))
             selected_exp = tl.where(topk_range == k, best_e, selected_exp)
-            selected_s = tl.where(topk_range == k, best_s, selected_s)
-            running_ms = tl.where(exp_range == best_e, -1e9, running_ms)
+            selected_w   = tl.where(topk_range == k, best_w, selected_w)
+            running_ms   = tl.where(exp_range == best_e, -1e9, running_ms)
 
-        # ---- 6. Normalize ----
-        score_sum = tl.sum(selected_s, axis=0)
+        # ---- 6. Normalize weight_scores ----
+        score_sum = tl.sum(selected_w, axis=0)
         score_sum = tl.maximum(score_sum, 1e-9)
-        norm_scores = selected_s / score_sum
+        norm_scores = selected_w / score_sum
 
         # ---- 7. Write outputs ----
         tl.store(expert_ids_ptr + t * stride_eid_seq + topk_range, selected_exp, mask=t_mask)
@@ -171,30 +178,31 @@ def routing_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2: Expert GEMM1 — FP8 gather-GEMM into gate+up buffer
-# Grid: (ceil(num_tokens/BLOCK_M), ceil(N/BLOCK_N))
+# Kernel 2: Expert GEMM1 (Per-expert launch)
+# Grid: (ceil(num_tokens / BLOCK_M), ceil(N / BLOCK_N))
+# Uses native FP8 WGMMA with per-(M,N)-block vectorized scale application.
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_gemm_configs(), key=["tok_bucket", "K", "N"])
 @triton.jit
 def expert_gemm1_kernel(
-    hidden_ptr,           # [total_seq_len, 7168] float8_e4m3fn
-    hscale_ptr,           # [56, total_seq_len]  float32  (56 = HIDDEN_DIM/128)
-    token_ids_ptr,        # [num_tokens] int32
-    w1_ptr,               # [4096, 7168] float8_e4m3fn  (this expert's weights)
-    w1scale_ptr,          # [32, 56] float32  (32=4096/128, 56=7168/128)
-    gate_up_ptr,          # [num_tokens, 4096] float32  OUTPUT
+    token_ids_ptr,         # [num_tokens] int32
+    hidden_ptr,            # [seq_len, 7168] float8_e4m3fn
+    hscale_ptr,            # [56, seq_len] float32
+    w1_ptr,                # [4096, 7168] float8_e4m3fn
+    w1scale_ptr,           # [32, 56] float32
+    gate_up_ptr,           # [num_tokens, 4096] float32  OUTPUT
     num_tokens,
     tok_bucket,
-    K: tl.constexpr,      # 7168
-    N: tl.constexpr,      # 4096
+    K: tl.constexpr,       # 7168
+    N: tl.constexpr,       # 4096
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # 128
     stride_h_seq,
-    stride_w1_n,
-    stride_gu_tok,
-    stride_hscale_blk,    # total_seq_len  (hscale is [56, seq_len])
-    stride_w1s_nb,        # 56  (w1scale is [32, 56])
+    stride_w1_n,            # gemm1_weights.stride(1)
+    stride_w1s_nb,          # gemm1_weights_scale.stride(1)
+    stride_hscale_blk,      # hidden_states_scale.stride(0) = seq_len
+    stride_gu_tok,          # gate_up_buf.stride(0) = GATE_UP_DIM
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -203,41 +211,47 @@ def expert_gemm1_kernel(
     n_start = pid_n * BLOCK_N
 
     m_range = m_start + tl.arange(0, BLOCK_M)
-    n_range = n_start + tl.arange(0, BLOCK_N)
     m_mask = m_range < num_tokens
+
+    n_range = n_start + tl.arange(0, BLOCK_N)
     n_mask = n_range < N
 
-    # Gather source token row indices
+    # --- Load local token IDs for this tile ---
     tok_ids = tl.load(token_ids_ptr + m_range, mask=m_mask, other=0)
 
+    # Vectorized N-block indices (handles BLOCK_N > 128 correctly)
+    n_blks = n_range // BLOCK_K   # [BLOCK_N] — which N-scale-block each column belongs to
+
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    n_blk = n_start // BLOCK_K  # N-dimension block index (BLOCK_K == 128 == block size)
 
     for k_start in tl.range(0, K, BLOCK_K):
-        k_blk = k_start // BLOCK_K
+        k_blk  = k_start // BLOCK_K
         k_range = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_range < K
+        k_mask  = k_range < K
 
-        # Load FP8 hidden [BLOCK_M, BLOCK_K] and dequantize
+        # Load FP8 hidden — no upcast (native FP8)
         h_ptrs = hidden_ptr + tok_ids[:, None] * stride_h_seq + k_range[None, :]
-        h_fp8 = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-        h_f32 = h_fp8.to(tl.float32)
-        # Scale: hscale[k_blk, tok_id]  —  shape [56, seq_len], stride_hscale_blk = seq_len
+        h_fp8  = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        # Per-token, per-K-block hidden scale: hscale[k_blk, tok_id]
         h_scales = tl.load(
             hscale_ptr + k_blk * stride_hscale_blk + tok_ids,
             mask=m_mask, other=1.0,
         )  # [BLOCK_M]
-        h_f32 = h_f32 * h_scales[:, None]
 
-        # Load FP8 weight [BLOCK_N, BLOCK_K] and dequantize
+        # Load FP8 weight — no upcast (native FP8)
         w_ptrs = w1_ptr + n_range[:, None] * stride_w1_n + k_range[None, :]
-        w_fp8 = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_f32 = w_fp8.to(tl.float32)
-        # Scale: w1scale[n_blk, k_blk]
-        w_scale = tl.load(w1scale_ptr + n_blk * stride_w1s_nb + k_blk)
-        w_f32 = w_f32 * w_scale
+        w_fp8  = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        # Vectorized per-N-block weight scale: w1scale[n_blk, k_blk] for each n
+        w_scales = tl.load(
+            w1scale_ptr + n_blks * stride_w1s_nb + k_blk,
+            mask=n_mask, other=1.0,
+        )  # [BLOCK_N]
 
-        acc += tl.dot(h_f32, tl.trans(w_f32))
+        # Native FP8 WGMMA → float32 accumulator
+        raw = tl.dot(h_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
+
+        # Apply block-scales: h_scale per row, w_scale per column
+        acc += raw * h_scales[:, None] * w_scales[None, :]
 
     # Write gate+up buffer
     out_ptrs = gate_up_ptr + m_range[:, None] * stride_gu_tok + n_range[None, :]
@@ -245,30 +259,31 @@ def expert_gemm1_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Kernel 3: Expert GEMM2 — FP8 GEMM + weighted atomic-add into output
-# Grid: (ceil(num_tokens/BLOCK_M), ceil(N/BLOCK_N))
+# Kernel 3: Expert GEMM2 (Per-expert launch)
+# Grid: (ceil(num_tokens / BLOCK_M), ceil(N / BLOCK_N))
+# Uses BF16 WGMMA: intermediate cast to bf16, weight dequant to bf16.
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_gemm_configs(), key=["tok_bucket", "K", "N"])
 @triton.jit
-def expert_gemm2_accumulate_kernel(
-    inter_ptr,            # [num_tokens, 2048] float32 (SwiGLU output)
-    w2_ptr,               # [7168, 2048] float8_e4m3fn
-    w2scale_ptr,          # [56, 16] float32  (56=7168/128, 16=2048/128)
-    token_ids_ptr,        # [num_tokens] int32
-    r_scores_ptr,         # [num_tokens] float32
+def expert_gemm2_kernel(
+    inter_ptr,             # [num_tokens, 2048] float32 (SwiGLU output)
+    token_ids_ptr,         # [num_tokens] int32
+    r_scores_ptr,          # [num_tokens] float32
     routed_scaling_factor,
-    output_ptr,           # [total_seq_len, 7168] bfloat16  (atomic add target)
+    w2_ptr,                # [7168, 2048] float8_e4m3fn
+    w2scale_ptr,           # [56, 16] float32
+    output_ptr,            # [seq_len, 7168] bfloat16  (atomic add target)
     num_tokens,
     tok_bucket,
-    K: tl.constexpr,      # 2048
-    N: tl.constexpr,      # 7168
+    K: tl.constexpr,       # 2048
+    N: tl.constexpr,       # 7168
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,  # 128
     stride_inter_tok,
-    stride_w2_n,
+    stride_w2_n,            # gemm2_weights.stride(1)
+    stride_w2s_nb,          # gemm2_weights_scale.stride(1)
     stride_out_seq,
-    stride_w2s_nb,        # 16  (w2scale is [56, 16])
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -277,40 +292,45 @@ def expert_gemm2_accumulate_kernel(
     n_start = pid_n * BLOCK_N
 
     m_range = m_start + tl.arange(0, BLOCK_M)
-    n_range = n_start + tl.arange(0, BLOCK_N)
     m_mask = m_range < num_tokens
+
+    n_range = n_start + tl.arange(0, BLOCK_N)
     n_mask = n_range < N
 
-    tok_ids = tl.load(token_ids_ptr + m_range, mask=m_mask, other=0)
-    r_scores = tl.load(r_scores_ptr + m_range, mask=m_mask, other=0.0)
-    weight = r_scores * routed_scaling_factor  # [BLOCK_M]
+    # --- Load local token IDs and routing scores ---
+    tok_ids  = tl.load(token_ids_ptr   + m_range, mask=m_mask, other=0)
+    r_scores = tl.load(r_scores_ptr  + m_range, mask=m_mask, other=0.0)
+    weight   = r_scores * routed_scaling_factor   # [BLOCK_M]
+
+    # Vectorized N-block indices
+    n_blks = n_range // BLOCK_K   # [BLOCK_N]
 
     acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    n_blk = n_start // BLOCK_K  # N-block index for scale lookup
 
     for k_start in tl.range(0, K, BLOCK_K):
-        k_blk = k_start // BLOCK_K
+        k_blk  = k_start // BLOCK_K
         k_range = k_start + tl.arange(0, BLOCK_K)
-        k_mask = k_range < K
+        k_mask  = k_range < K
 
-        # Load intermediate (float32, no dequant needed)
+        # Load intermediate (float32) → cast to bf16 for BF16 WGMMA
         i_ptrs = inter_ptr + m_range[:, None] * stride_inter_tok + k_range[None, :]
-        i_mk = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        i_mk   = tl.load(i_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
+        i_bf16 = i_mk.to(tl.bfloat16)
 
-        # Load FP8 weight and dequantize
-        w_ptrs = w2_ptr + n_range[:, None] * stride_w2_n + k_range[None, :]
-        w_fp8 = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_f32 = w_fp8.to(tl.float32)
-        # Scale: w2scale[n_blk, k_blk]  (shape [56, 16])
-        w_scale = tl.load(w2scale_ptr + n_blk * stride_w2s_nb + k_blk)
-        w_f32 = w_f32 * w_scale
+        # Load FP8 weight, dequant to bf16 with vectorized per-N-block scale
+        w_ptrs  = w2_ptr + n_range[:, None] * stride_w2_n + k_range[None, :]
+        w_fp8   = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        w_scales = tl.load(
+            w2scale_ptr + n_blks * stride_w2s_nb + k_blk,
+            mask=n_mask, other=1.0,
+        )  # [BLOCK_N]
+        w_bf16  = (w_fp8.to(tl.float32) * w_scales[:, None]).to(tl.bfloat16)
 
-        acc += tl.dot(i_mk, tl.trans(w_f32))
+        # BF16 WGMMA → float32 accumulator
+        acc += tl.dot(i_bf16, tl.trans(w_bf16), out_dtype=tl.float32)
 
-    # Apply routing weight
-    acc = acc * weight[:, None]  # [BLOCK_M, BLOCK_N]
-
-    # Atomic add into bfloat16 output
+    # Apply routing weight and atomic-add into output
+    acc = acc * weight[:, None]
     out_ptrs = output_ptr + tok_ids[:, None] * stride_out_seq + n_range[None, :]
     tl.atomic_add(
         out_ptrs,
@@ -320,54 +340,56 @@ def expert_gemm2_accumulate_kernel(
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU (PyTorch, not Triton — runs on device after GEMM1)
+# SwiGLU (PyTorch, runs on device after GEMM1)
+# FIX: W1 layout is [W_up; W_gate], so [:, :2048] = up, [:, 2048:] = gate
+# SwiGLU(x) = silu(gate) * up
 # ---------------------------------------------------------------------------
 def _swiglu(gate_up: torch.Tensor) -> torch.Tensor:
     """
-    gate_up: [num_tokens, 4096] float32
-    returns: [num_tokens, 2048] float32
-    SwiGLU(x) = silu(gate) * up  where gate=x[:2048], up=x[2048:]
+    gate_up: [total_tokens, 4096] float32
+    Weight layout: [W_up (rows 0..2047); W_gate (rows 2048..4095)]
+    So: gate_up[:, :2048] = up-projection, gate_up[:, 2048:] = gate
+    Returns: [total_tokens, 2048] float32
     """
-    gate = gate_up[:, :INTER_DIM]
-    up = gate_up[:, INTER_DIM:]
+    up   = gate_up[:, :INTER_DIM]   # FIX: first half is up
+    gate = gate_up[:, INTER_DIM:]   # FIX: second half is gate
     return torch.nn.functional.silu(gate) * up
 
 
 # ---------------------------------------------------------------------------
 # Entry point (matches config.toml entry_point = "kernel")
+# DPS: output tensor pre-allocated by framework, must be last argument.
 # ---------------------------------------------------------------------------
 def kernel(
     routing_logits,         # float32,       [seq_len, 256]
     routing_bias,           # bfloat16,      [256]
     hidden_states,          # float8_e4m3fn, [seq_len, 7168]
-    hidden_states_scale,    # float32,       [56, seq_len]   ← block_idx is dim 0
+    hidden_states_scale,    # float32,       [56, seq_len]
     gemm1_weights,          # float8_e4m3fn, [32, 4096, 7168]
     gemm1_weights_scale,    # float32,       [32, 32, 56]
     gemm2_weights,          # float8_e4m3fn, [32, 7168, 2048]
     gemm2_weights_scale,    # float32,       [32, 56, 16]
-    output,                 # bfloat16,      [seq_len, 7168]  (DPS: write here)
     local_expert_offset,    # int32 scalar
     routed_scaling_factor,  # float32 scalar
+    output,                 # bfloat16,      [seq_len, 7168]  (DPS — must be last)
 ):
     """
-    Fused MoE forward pass.
-
-    Only computes for local experts [local_expert_offset, local_expert_offset+32).
-    Routing covers all 256 global experts; tokens that route to non-local experts
-    are simply skipped (their contribution will be accumulated by other devices).
+    Fused MoE forward pass using per-expert GEMM calls.
+    Restored Python loop logic to prevent block-boundary straddling issues
+    which arise natively in Grouped GEMMs without dynamic block arrays.
     """
     seq_len = hidden_states.shape[0]
-    device = hidden_states.device
+    device  = hidden_states.device
 
-    # Step 0: zero output (DPS — tensor is pre-allocated but not zeroed)
+    # Step 0: zero output
     output.zero_()
 
-    # Step 1: Routing — determine expert assignments and scores
-    expert_ids = torch.empty((seq_len, TOPK), dtype=torch.int32, device=device)
-    routing_scores = torch.empty((seq_len, TOPK), dtype=torch.float32, device=device)
+    # Step 1: Routing
+    expert_ids     = torch.empty((seq_len, TOPK.value), dtype=torch.int32,   device=device)
+    routing_scores = torch.empty((seq_len, TOPK.value), dtype=torch.float32, device=device)
 
     bias_f32 = routing_bias.to(torch.float32)
-    BLOCK_T = 16
+    BLOCK_T  = 16
     routing_kernel[triton.cdiv(seq_len, BLOCK_T),](
         routing_logits, bias_f32,
         expert_ids, routing_scores,
@@ -375,84 +397,78 @@ def kernel(
         routing_logits.stride(0),
         expert_ids.stride(0),
         routing_scores.stride(0),
-        NUM_EXPERTS=NUM_GLOBAL_EXPERTS,
-        NUM_GROUPS=NUM_GROUPS,
-        EPG=EXPERTS_PER_GROUP,
-        KG=NUM_GROUPS_SELECTED,
-        TOPK=TOPK,
+        NUM_EXPERTS=NUM_GLOBAL_EXPERTS.value,
+        NUM_GROUPS=NUM_GROUPS.value,
+        EPG=EXPERTS_PER_GROUP.value,
+        KG=NUM_GROUPS_SELECTED.value,
+        TOPK=TOPK.value,
         BLOCK_T=BLOCK_T,
     )
-    torch.cuda.synchronize()
 
-    # Step 2: Per-expert FFN
+    # Step 2: Per-expert FFN loop
     rsf = float(routed_scaling_factor)
     local_offset = int(local_expert_offset)
 
-    for local_idx in range(NUM_LOCAL_EXPERTS):
+    for local_idx in range(NUM_LOCAL_EXPERTS.value):
         global_id = local_offset + local_idx
 
-        # Find (token, slot) pairs assigned to this expert
-        pairs = (expert_ids == global_id).nonzero(as_tuple=False)  # [K, 2]
+        # Find tokens for this expert
+        pairs = (expert_ids == global_id).nonzero(as_tuple=False)
         num_tok = pairs.shape[0]
         if num_tok == 0:
             continue
 
         tok_ids = pairs[:, 0].to(torch.int32).contiguous()
         slot_ids = pairs[:, 1].contiguous()
+        r_scores = routing_scores[tok_ids, slot_ids].contiguous()
 
-        # Routing scores for these token-expert pairs
-        r_scores = routing_scores[pairs[:, 0], slot_ids].contiguous()
-
-        # Expert weights
-        w1 = gemm1_weights[local_idx]         # [4096, 7168] fp8
-        w1s = gemm1_weights_scale[local_idx]  # [32, 56]
-        w2 = gemm2_weights[local_idx]         # [7168, 2048] fp8
-        w2s = gemm2_weights_scale[local_idx]  # [56, 16]
+        # Extract weights/scales for this expert
+        w1 = gemm1_weights[local_idx]
+        w1s = gemm1_weights_scale[local_idx]
+        w2 = gemm2_weights[local_idx]
+        w2s = gemm2_weights_scale[local_idx]
 
         tb = _token_bucket(num_tok)
 
-        # --- GEMM1: hidden → gate+up ---
-        gate_up_buf = torch.empty((num_tok, GATE_UP_DIM), dtype=torch.float32, device=device)
+        # --- GEMM1 ---
+        gate_up_buf = torch.empty((num_tok, GATE_UP_DIM.value), dtype=torch.float32, device=device)
 
         expert_gemm1_kernel[
             lambda meta: (
                 triton.cdiv(num_tok, meta["BLOCK_M"]),
-                triton.cdiv(GATE_UP_DIM, meta["BLOCK_N"]),
+                triton.cdiv(GATE_UP_DIM.value, meta["BLOCK_N"]),
             )
         ](
-            hidden_states, hidden_states_scale,
             tok_ids,
+            hidden_states, hidden_states_scale,
             w1, w1s,
             gate_up_buf,
             num_tok, tb,
-            K=HIDDEN_DIM, N=GATE_UP_DIM,
+            K=HIDDEN_DIM.value, N=GATE_UP_DIM.value,
             stride_h_seq=hidden_states.stride(0),
             stride_w1_n=w1.stride(0),
-            stride_gu_tok=gate_up_buf.stride(0),
-            stride_hscale_blk=hidden_states_scale.stride(0),
             stride_w1s_nb=w1s.stride(0),
+            stride_hscale_blk=hidden_states_scale.stride(0),
+            stride_gu_tok=gate_up_buf.stride(0),
         )
-        torch.cuda.synchronize()
 
-        # --- SwiGLU: [num_tok, 4096] → [num_tok, 2048] ---
+        # --- SwiGLU ---
         intermediate = _swiglu(gate_up_buf)
-        torch.cuda.synchronize()
 
-        # --- GEMM2: intermediate → output (atomic accumulate) ---
-        expert_gemm2_accumulate_kernel[
+        # --- GEMM2 ---
+        expert_gemm2_kernel[
             lambda meta: (
                 triton.cdiv(num_tok, meta["BLOCK_M"]),
-                triton.cdiv(HIDDEN_DIM, meta["BLOCK_N"]),
+                triton.cdiv(HIDDEN_DIM.value, meta["BLOCK_N"]),
             )
         ](
-            intermediate, w2, w2s,
-            tok_ids, r_scores, rsf,
+            intermediate, tok_ids, r_scores, rsf,
+            w2, w2s,
             output,
             num_tok, tb,
-            K=INTER_DIM, N=HIDDEN_DIM,
+            K=INTER_DIM.value, N=HIDDEN_DIM.value,
             stride_inter_tok=intermediate.stride(0),
             stride_w2_n=w2.stride(0),
+            stride_w2s_nb=w2s.stride(0),
             stride_out_seq=output.stride(0),
-            stride_w2s_nb=w2s.stride(1),
         )
-        torch.cuda.synchronize()

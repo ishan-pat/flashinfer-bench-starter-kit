@@ -72,7 +72,16 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     for trace in traces:
         if trace.evaluation:
-            err_msg = getattr(trace.evaluation, 'error_msg', None) or getattr(trace.evaluation, 'exception', None)
+            err_msg = (
+                getattr(trace.evaluation, 'error_msg', None)
+                or getattr(trace.evaluation, 'exception', None)
+                or getattr(trace.evaluation, 'error', None)
+            )
+            # Fallback: dump all non-None scalar attrs for debugging
+            if not err_msg:
+                extra = {k: str(v) for k, v in vars(trace.evaluation).items()
+                         if v is not None and k not in ('status', 'performance', 'correctness')}
+                err_msg = repr(extra) if extra else None
             entry = {
                 "status": trace.evaluation.status.value,
                 "error": str(err_msg) if err_msg else None,
