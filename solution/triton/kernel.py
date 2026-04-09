@@ -351,8 +351,8 @@ def _swiglu(gate_up: torch.Tensor) -> torch.Tensor:
     So: gate_up[:, :2048] = up-projection, gate_up[:, 2048:] = gate
     Returns: [total_tokens, 2048] float32
     """
-    up   = gate_up[:, :INTER_DIM]   # FIX: first half is up
-    gate = gate_up[:, INTER_DIM:]   # FIX: second half is gate
+    gate = gate_up[:, :INTER_DIM]   # FIX: first half is gate
+    up   = gate_up[:, INTER_DIM:]   # FIX: second half is up
     return torch.nn.functional.silu(gate) * up
 
 

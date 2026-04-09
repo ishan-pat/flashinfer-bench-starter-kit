@@ -68,12 +68,19 @@ def diagnose():
         torch.cuda.synchronize()
         print("Kernel completed successfully!")
         
-        print(f"safetensors keys: {safe_tensors.keys()}")
+        print(f"safetensors keys: {list(safe_tensors.keys())}")
         out_key = None
-        for key in safe_tensors.keys():
-            if "out" in key.lower():
-                out_key = key
-                break
+        # Try specific known output keys or any key that isn't input-like
+        candidates = [k for k in safe_tensors.keys() if "out" in k.lower() or "final" in k.lower() or "output" in k.lower()]
+        if not candidates:
+            # Fallback: find the tensor that matches our output shape [seq_len, 7168]
+            expected_shape = list(out[0].shape)
+            for k, v in safe_tensors.items():
+                if list(v.shape) == expected_shape:
+                    out_key = k
+                    break
+        else:
+            out_key = candidates[0]
         
         if out_key:
             print(f"Comparing against reference (key: {out_key})...")
