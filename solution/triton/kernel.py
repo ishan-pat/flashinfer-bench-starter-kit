@@ -274,9 +274,12 @@ def grouped_gemm1_kernel(
             mask=n_mask, other=1.0,
         )
 
-        # Native FP8 WGMMA → float32, then apply block scales
-        raw  = tl.dot(h_fp8, tl.trans(w_fp8), out_dtype=tl.float32)
-        acc += raw * h_scales[:, None] * w_scales[None, :]
+        # Dequantize to float32 before dot (matches reference numerics).
+        # h_f32[m, k] = h_fp8[m, k] * h_scale[m]  (per-token scale for this K-block)
+        # w_f32[n, k] = w_fp8[n, k] * w_scale[n]  (per-N-block scale for this K-block)
+        h_f32 = h_fp8.to(tl.float32) * h_scales[:, None]  # [BM, BK]
+        w_f32 = w_fp8.to(tl.float32) * w_scales[:, None]  # [BN, BK]
+        acc  += tl.dot(h_f32, tl.trans(w_f32), out_dtype=tl.float32)
 
     # Write gate+up buffer at sorted positions
     out_m    = e_start + m_range
@@ -287,9 +290,10 @@ def grouped_gemm1_kernel(
 # ---------------------------------------------------------------------------
 # Kernel 2: Fused SwiGLU
 #
-# inter = silu(gate) * up
-# where  gate = gate_up[:, :2048]  (first  half — matches feature/batch_gemms fix)
-#        up   = gate_up[:, 2048:]  (second half)
+# Weight layout: [W_up ; W_gate] (up first, gate second)
+# So:  up   = gate_up[:, :2048]   (first  half)
+#      gate = gate_up[:, 2048:]   (second half)
+# SwiGLU = silu(gate) * up  — matches reference: silu(X2) * X1
 #
 # Grid: (ceil(N_assigned * INTER_DIM / BLOCK_SIZE),)
 # ---------------------------------------------------------------------------
@@ -309,10 +313,12 @@ def swiglu_kernel(
     col  = offs %  INTER_DIM
     row_stride = INTER_DIM * 2                              # gate_up row width = 4096
 
-    gate = tl.load(gate_up_ptr + tok * row_stride + col,              mask=mask, other=0.0)
-    up   = tl.load(gate_up_ptr + tok * row_stride + INTER_DIM + col,  mask=mask, other=0.0)
+    # up   = first  half (col offset 0)
+    # gate = second half (col offset INTER_DIM)
+    up   = tl.load(gate_up_ptr + tok * row_stride + col,              mask=mask, other=0.0)
+    gate = tl.load(gate_up_ptr + tok * row_stride + INTER_DIM + col,  mask=mask, other=0.0)
 
-    # silu(gate) * up
+    # silu(gate) * up  — gate is second half, matches reference
     out  = gate / (1.0 + tl.exp(-gate)) * up
 
     tl.store(inter_ptr + offs, out, mask=mask)
