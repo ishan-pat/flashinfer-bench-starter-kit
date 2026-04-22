@@ -7,22 +7,22 @@ Target: moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
   - FP8 E4M3FN weights with 128-element block scaling
   - DeepSeek routing: 8 groups, top-4 groups, top-8 experts
 
-Optimization: token-sorted grouped GEMM.
+Optimization: token-sorted grouped GEMM + fused SwiGLU epilogue.
   Old: 32 Python-loop iterations × 2 kernels = 64 serial launches.
-  New: 3 Triton kernel launches covering all 32 experts simultaneously.
-  Also eliminates full upfront weight dequantization (~5.7 GB materialized in baseline).
+  New: 2 Triton kernel launches covering all 32 experts simultaneously.
+  Also eliminates full upfront weight dequantization (~5.7 GB materialized in baseline)
+  and the gate_up_buf round-trip (~0.5 GB at full batch).
 
 Pipeline:
   routing (PyTorch, proven correct) → token sort (PyTorch) →
-  grouped_gemm1 (FP8 dequant → float32 dot) →
-  swiglu (fused, silu(second_half) * first_half) →
+  grouped_gemm1 (FP8 MMA + fused SwiGLU epilogue, writes inter directly) →
   grouped_gemm2 (FP8 dequant → float32 dot, atomic scatter) →
   cast to bf16 output
 
 SwiGLU convention (verified against baseline passing all 19 workloads):
-  gate_up[:, :INTER_DIM]  = first_half   (the "up" values)
-  gate_up[:, INTER_DIM:]  = second_half  (the "gate" values)
-  output = silu(second_half) * first_half  =  silu(gate) * up
+  w1[:, :INTER_DIM,       :] → up    rows (first_half of gate_up)
+  w1[:, INTER_DIM:,       :] → gate  rows (second_half of gate_up)
+  output = silu(gate) * up   ==   silu(second_half) * first_half
 """
 
 import torch
@@ -156,21 +156,21 @@ def _sort_tokens(expert_ids, weights_full, local_offset, device):
 
 
 # ---------------------------------------------------------------------------
-# Kernel 1: Grouped GEMM1
+# Kernel 1: Grouped GEMM1 with fused SwiGLU epilogue
 #
-# gate_up_buf[sorted_pos] = hidden[sorted_tok_ids[sorted_pos]] @ w1[expert].T
-# for all 32 local experts in a single launch.
+# For every sorted position m and output column c ∈ [0, INTER_DIM):
+#   up   [m, c] = hidden[tok_ids[m]] @ w1[e, c,            :].T
+#   gate [m, c] = hidden[tok_ids[m]] @ w1[e, INTER_DIM + c, :].T
+#   inter[m, c] = silu(gate[m, c]) * up[m, c]
 #
-# Grid: (NUM_LOCAL_EXPERTS * ceil(max_tok / BLOCK_M),  ceil(GATE_UP_DIM / BLOCK_N))
+# The grid tiles over INTER_DIM columns (not GATE_UP_DIM), so each tile
+# computes a BLOCK_N-wide slice of inter directly. Per inner K iteration we
+# run two FP8 MMAs sharing the hidden load — one against the "up" weight
+# rows [0, INTER_DIM), one against the "gate" weight rows [INTER_DIM, 2*INTER_DIM).
+# Both 128-K-block scale drains happen in-register; SwiGLU is applied once
+# at the end and the result is stored to inter_buf.
 #
-# Expert dispatch:
-#   tiles_per_expert = ceil(max_tok / BLOCK_M)  [computed INSIDE kernel from constexpr]
-#   expert_id        = pid_m // tiles_per_expert
-#   m_in_expert      = pid_m %  tiles_per_expert
-#
-# Scale dequant: tile-by-tile (avoids materializing full float32 weight matrices).
-#   h_f32[m, k] = h_fp8[m, k] * hidden_states_scale[k_blk, tok_id]
-#   w_f32[n, k] = w_fp8[n, k] * gemm1_weights_scale[expert, n_blk, k_blk]
+# Grid: (NUM_LOCAL_EXPERTS * ceil(max_tok / BLOCK_M),  ceil(INTER_DIM / BLOCK_N))
 # ---------------------------------------------------------------------------
 @triton.autotune(configs=_gemm_configs(), key=["n_assigned_bucket", "N"])
 @triton.jit
@@ -188,14 +188,14 @@ def grouped_gemm1_kernel(
     w1_ptr,                # [32, 4096, 7168]  fp8_e4m3fn
     w1scale_ptr,           # [32, 32, 56]      float32
 
-    # Output
-    gate_up_ptr,           # [N_assigned, 4096] float32
+    # Output (fused SwiGLU target)
+    inter_ptr,             # [N_assigned, 2048] float32
     N_assigned,
     n_assigned_bucket,
 
     # Shape constants
     K: tl.constexpr,       # 7168
-    N: tl.constexpr,       # 4096
+    N: tl.constexpr,       # 2048 (= INTER_DIM)
 
     # Strides
     stride_h_seq,
@@ -204,7 +204,7 @@ def grouped_gemm1_kernel(
     stride_w1s_exp,
     stride_w1s_nb,
     stride_hscale_blk,
-    stride_gu_tok,
+    stride_inter_tok,
 
     # Block sizes
     BLOCK_M: tl.constexpr,
@@ -232,22 +232,26 @@ def grouped_gemm1_kernel(
 
     tok_ids = tl.load(sorted_tok_ids_ptr + global_m, mask=m_mask, other=0)
 
-    n_start  = pid_n * BLOCK_N
-    n_range  = n_start + tl.arange(0, BLOCK_N)
-    n_mask   = n_range < N
-    n_blks   = n_range // BLOCK_K
+    n_start      = pid_n * BLOCK_N
+    n_range      = n_start + tl.arange(0, BLOCK_N)                  # "up"   cols in [0, INTER_DIM)
+    n_mask       = n_range < N
+    n_range_gate = n_range + N                                       # "gate" rows in [INTER_DIM, 2*INTER_DIM)
+
+    n_blks_up   = n_range      // BLOCK_K                            # weight-scale n-block indices
+    n_blks_gate = n_range_gate // BLOCK_K
 
     w1_base  = w1_ptr      + expert_id * stride_w1_exp
     w1s_base = w1scale_ptr + expert_id * stride_w1s_exp
 
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_up   = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_gate = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
 
     for k_start in tl.range(0, K, BLOCK_K):
         k_blk   = k_start // BLOCK_K
         k_range = k_start + tl.arange(0, BLOCK_K)
         k_mask  = k_range < K
 
-        # FP8 hidden  [BM, BK]  (gather rows)
+        # FP8 hidden  [BM, BK]  — shared between the up-MMA and the gate-MMA
         h_ptrs  = hidden_ptr + tok_ids[:, None] * stride_h_seq + k_range[None, :]
         h_fp8   = tl.load(h_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
         h_scales = tl.load(
@@ -255,63 +259,40 @@ def grouped_gemm1_kernel(
             mask=m_mask, other=1.0,
         )
 
-        # FP8 weight  [BN, BK]
-        w_ptrs  = w1_base + n_range[:, None] * stride_w1_n + k_range[None, :]
-        w_fp8   = tl.load(w_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
-        w_scales = tl.load(
-            w1s_base + n_blks * stride_w1s_nb + k_blk,
+        # FP8 weight "up" half   [BN, BK]
+        w_up_ptrs  = w1_base + n_range[:, None] * stride_w1_n + k_range[None, :]
+        w_up_fp8   = tl.load(w_up_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        w_up_scales = tl.load(
+            w1s_base + n_blks_up * stride_w1s_nb + k_blk,
             mask=n_mask, other=1.0,
         )
 
-        # Dequant to float32, then dot — numerically matches baseline
-        h_f32 = h_fp8.to(tl.float32) * h_scales[:, None]   # [BM, BK]
-        w_f32 = w_fp8.to(tl.float32) * w_scales[:, None]   # [BN, BK]
-        acc  += tl.dot(h_f32, tl.trans(w_f32), out_dtype=tl.float32)
+        # FP8 weight "gate" half [BN, BK]
+        w_gate_ptrs  = w1_base + n_range_gate[:, None] * stride_w1_n + k_range[None, :]
+        w_gate_fp8   = tl.load(w_gate_ptrs, mask=n_mask[:, None] & k_mask[None, :], other=0.0)
+        w_gate_scales = tl.load(
+            w1s_base + n_blks_gate * stride_w1s_nb + k_blk,
+            mask=n_mask, other=1.0,
+        )
+
+        # Two native FP8 MMAs sharing h_fp8; fp32 TC accumulators.
+        # DeepSeek-V3 N_C=128 two-level promotion: drain each per 128-K block.
+        acc_up_block   = tl.dot(h_fp8, tl.trans(w_up_fp8),   out_dtype=tl.float32)
+        acc_gate_block = tl.dot(h_fp8, tl.trans(w_gate_fp8), out_dtype=tl.float32)
+
+        acc_up   += acc_up_block   * h_scales[:, None] * w_up_scales[None, :]
+        acc_gate += acc_gate_block * h_scales[:, None] * w_gate_scales[None, :]
+
+    # Fused SwiGLU epilogue: silu(gate) * up, where silu(x) = x * sigmoid(x).
+    inter_tile = (acc_gate / (1.0 + tl.exp(-acc_gate))) * acc_up
 
     out_m    = e_start + m_range
-    out_ptrs = gate_up_ptr + out_m[:, None] * stride_gu_tok + n_range[None, :]
-    tl.store(out_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+    out_ptrs = inter_ptr + out_m[:, None] * stride_inter_tok + n_range[None, :]
+    tl.store(out_ptrs, inter_tile, mask=m_mask[:, None] & n_mask[None, :])
 
 
 # ---------------------------------------------------------------------------
-# Kernel 2: Fused SwiGLU
-#
-# Verified against baseline (passes all 19 workloads):
-#   first_half  = gate_up[:, :INTER_DIM]   — the "up"  values
-#   second_half = gate_up[:, INTER_DIM:]   — the "gate" values
-#   output      = silu(second_half) * first_half
-#
-# Grid: (ceil(N_assigned * INTER_DIM / BLOCK_SIZE),)
-# ---------------------------------------------------------------------------
-@triton.jit
-def swiglu_kernel(
-    gate_up_ptr,
-    inter_ptr,
-    N_assigned,
-    INTER_DIM: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-):
-    pid  = tl.program_id(0)
-    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = offs < N_assigned * INTER_DIM
-
-    tok        = offs // INTER_DIM
-    col        = offs %  INTER_DIM
-    row_stride = INTER_DIM * 2
-
-    # first_half = gate_up[:, :INTER_DIM]  (col offset 0)
-    # second_half = gate_up[:, INTER_DIM:] (col offset INTER_DIM)
-    first_half  = tl.load(gate_up_ptr + tok * row_stride + col,             mask=mask, other=0.0)
-    second_half = tl.load(gate_up_ptr + tok * row_stride + INTER_DIM + col, mask=mask, other=0.0)
-
-    # silu(second_half) * first_half  — matches baseline exactly
-    out = second_half / (1.0 + tl.exp(-second_half)) * first_half
-
-    tl.store(inter_ptr + offs, out, mask=mask)
-
-
-# ---------------------------------------------------------------------------
-# Kernel 3: Grouped GEMM2
+# Kernel 2: Grouped GEMM2
 #
 # output_f32[tok_ids[m]] += (r_scores[m] * rsf) × inter[m] @ w2[expert].T
 # for all 32 local experts in a single launch.
@@ -319,7 +300,11 @@ def swiglu_kernel(
 # Uses tl.atomic_add scatter — required because top-8 routing means
 # multiple experts contribute to the same output token row.
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_gemm_configs(), key=["n_assigned_bucket", "N"])
+@triton.autotune(
+    configs=_gemm_configs(),
+    key=["n_assigned_bucket", "N"],
+    reset_to_zero=("output_ptr",),
+)
 @triton.jit
 def grouped_gemm2_kernel(
     # Sorted token data
@@ -457,43 +442,33 @@ def kernel(
         output.zero_()
         return
 
-    gate_up_buf = torch.empty(N_assigned, GATE_UP_DIM, dtype=torch.float32, device=device)
-    inter_buf   = torch.empty(N_assigned, INTER_DIM,   dtype=torch.float32, device=device)
+    inter_buf = torch.empty(N_assigned, INTER_DIM, dtype=torch.float32, device=device)
 
-    # 4. Grouped GEMM1 — all 32 experts, single launch
+    # 4. Grouped GEMM1 with fused SwiGLU — writes inter_buf directly
     grouped_gemm1_kernel[
         lambda meta: (
             NUM_LOCAL_EXPERTS * triton.cdiv(max_tok, meta["BLOCK_M"]),
-            triton.cdiv(GATE_UP_DIM, meta["BLOCK_N"]),
+            triton.cdiv(INTER_DIM, meta["BLOCK_N"]),
         )
     ](
         sorted_tok_ids, expert_offsets, max_tok,
         hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_weights_scale,
-        gate_up_buf,
+        inter_buf,
         N_assigned,
         _bucket(N_assigned),
         K=HIDDEN_DIM,
-        N=GATE_UP_DIM,
+        N=INTER_DIM,
         stride_h_seq      = hidden_states.stride(0),
         stride_w1_exp     = gemm1_weights.stride(0),
         stride_w1_n       = gemm1_weights.stride(1),
         stride_w1s_exp    = gemm1_weights_scale.stride(0),
         stride_w1s_nb     = gemm1_weights_scale.stride(1),
         stride_hscale_blk = hidden_states_scale.stride(0),
-        stride_gu_tok     = gate_up_buf.stride(0),
+        stride_inter_tok  = inter_buf.stride(0),
     )
 
-    # 5. Fused SwiGLU
-    SWIGLU_BLOCK = 1024
-    swiglu_kernel[triton.cdiv(N_assigned * INTER_DIM, SWIGLU_BLOCK),](
-        gate_up_buf, inter_buf,
-        N_assigned,
-        INTER_DIM=INTER_DIM,
-        BLOCK_SIZE=SWIGLU_BLOCK,
-    )
-
-    # 6. Grouped GEMM2 — atomic scatter-add to output_f32
+    # 5. Grouped GEMM2 — atomic scatter-add to output_f32
     grouped_gemm2_kernel[
         lambda meta: (
             NUM_LOCAL_EXPERTS * triton.cdiv(max_tok, meta["BLOCK_M"]),
@@ -517,5 +492,5 @@ def kernel(
         stride_out_seq    = output_f32.stride(0),
     )
 
-    # 7. Cast float32 accumulation → bf16 output (DPS)
+    # 6. Cast float32 accumulation → bf16 output (DPS)
     output.copy_(output_f32.to(torch.bfloat16))
