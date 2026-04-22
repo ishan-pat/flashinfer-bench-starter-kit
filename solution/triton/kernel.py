@@ -49,10 +49,25 @@ GATE_UP_DIM         = INTER_DIM * 2  # 4096
 # Autotune configs for B200
 # BLOCK_K is always 128 — must align with FP8 block-scale granularity.
 # ---------------------------------------------------------------------------
-def _gemm_configs():
+def _gemm1_configs():
+    """Autotune configs for GEMM1. N=INTER_DIM=2048."""
     configs = []
     for bm in [64, 128]:
         for bn in [128, 256]:
+            for ns in [3, 4, 5]:
+                for nw in [8, 16]:
+                    configs.append(triton.Config(
+                        {"BLOCK_M": bm, "BLOCK_N": bn, "BLOCK_K": 128},
+                        num_stages=ns, num_warps=nw,
+                    ))
+    return configs
+
+
+def _gemm2_configs():
+    """Autotune configs for GEMM2. N=HIDDEN_DIM=7168, includes BLOCK_N=512."""
+    configs = []
+    for bm in [64, 128]:
+        for bn in [128, 256, 512]:
             for ns in [3, 4, 5]:
                 for nw in [8, 16]:
                     configs.append(triton.Config(
@@ -172,7 +187,7 @@ def _sort_tokens(expert_ids, weights_full, local_offset, device):
 #
 # Grid: (NUM_LOCAL_EXPERTS * ceil(max_tok / BLOCK_M),  ceil(INTER_DIM / BLOCK_N))
 # ---------------------------------------------------------------------------
-@triton.autotune(configs=_gemm_configs(), key=["n_assigned_bucket", "N"])
+@triton.autotune(configs=_gemm1_configs(), key=["n_assigned_bucket", "N"])
 @triton.jit
 def grouped_gemm1_kernel(
     # Sorted token data
@@ -301,7 +316,7 @@ def grouped_gemm1_kernel(
 # multiple experts contribute to the same output token row.
 # ---------------------------------------------------------------------------
 @triton.autotune(
-    configs=_gemm_configs(),
+    configs=_gemm2_configs(),
     key=["n_assigned_bucket", "N"],
     reset_to_zero=("output_ptr",),
 )
